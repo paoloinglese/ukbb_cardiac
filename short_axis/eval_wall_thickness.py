@@ -15,6 +15,11 @@
 import os
 import argparse
 import pandas as pd
+import sys
+
+import sys
+sys.path.insert(0, 'P:\\GitHub')
+
 from ukbb_cardiac.common.cardiac_utils import *
 
 
@@ -34,14 +39,15 @@ if __name__ == '__main__':
 
         # Quality control for segmentation at ED
         # If the segmentation quality is low, evaluation of wall thickness may fail.
-        seg_sa_name = '{0}/seg_sa_ED.nii.gz'.format(data_dir)
+        seg_sa_name = '{0}/seg_lvsa_SR_ED.nii.gz'.format(data_dir)  # seg_sa_ED
         if not os.path.exists(seg_sa_name):
-            continue
+            print('File does not exist')
         if not sa_pass_quality_control(seg_sa_name):
+            print('Not pass SA quality control')
             continue
 
         # Evaluate myocardial wall thickness
-        evaluate_wall_thickness('{0}/seg_sa_ED.nii.gz'.format(data_dir),
+        evaluate_wall_thickness('{0}/seg_lvsa_SR_ED.nii.gz'.format(data_dir),
                                 '{0}/wall_thickness_ED'.format(data_dir))
 
         # Record data
