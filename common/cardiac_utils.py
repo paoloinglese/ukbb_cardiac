@@ -26,6 +26,9 @@ import skimage
 from ukbb_cardiac.common.image_utils import *
 
 
+LABEL = {'LV': 1, 'Myo': 2, 'RV': 4}
+
+
 def approximate_contour(contour, factor=4, smooth=0.05, periodic=False):
     """ Approximate a contour.
 
@@ -73,18 +76,22 @@ def approximate_contour(contour, factor=4, smooth=0.05, periodic=False):
     return contour2
 
 
-def sa_pass_quality_control(seg_sa_name):
+def sa_pass_quality_control(seg_sa_name, fix=False):
     """ Quality control for short-axis image segmentation """
     nim = nib.load(seg_sa_name)
     seg_sa = nim.get_data()
+    seg_sa = seg_sa.squeeze()
     X, Y, Z = seg_sa.shape[:3]
 
-    # Label class in the segmentation
-    label = {'LV': 1, 'Myo': 2, 'RV': 4}
+    if fix:
+        im_z = seg_sa[:, :, 24]
+        im_z[im_z == 2] = 1
+        seg_sa[:, :, 24] = im_z
+
 
     # Criterion 1: every class exists and the area is above a threshold
     # Count number of pixels in 3D
-    for l_name, l in label.items():
+    for l_name, l in LABEL.items():
         pixel_thres = 10
         if np.sum(seg_sa == l) < pixel_thres:
             print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
@@ -96,8 +103,8 @@ def sa_pass_quality_control(seg_sa_name):
     z_pos = []
     for z in range(Z):
         seg_z = seg_sa[:, :, z]
-        endo = (seg_z == label['LV']).astype(np.uint8)
-        myo = (seg_z == label['Myo']).astype(np.uint8)
+        endo = (seg_z == LABEL['LV']).astype(np.uint8)
+        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
         pixel_thres = 10
         if (np.sum(endo) < pixel_thres) or (np.sum(myo) < pixel_thres):
             continue
@@ -115,17 +122,17 @@ def sa_pass_quality_control(seg_sa_name):
         return False
 
     # Criterion 3: LV and RV exists on the mid-cavity slice
-    _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == label['LV'])]
+    _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == LABEL['LV'])]
     z = int(round(cz))
     seg_z = seg_sa[:, :, z]
 
-    endo = (seg_z == label['LV']).astype(np.uint8)
+    endo = (seg_z == LABEL['LV']).astype(np.uint8)
     endo = get_largest_cc(endo).astype(np.uint8)
-    myo = (seg_z == label['Myo']).astype(np.uint8)
+    myo = (seg_z == LABEL['Myo']).astype(np.uint8)
     myo = remove_small_cc(myo).astype(np.uint8)
     epi = (endo | myo).astype(np.uint8)
     epi = get_largest_cc(epi).astype(np.uint8)
-    rv = (seg_z == label['RV']).astype(np.uint8)
+    rv = (seg_z == LABEL['RV']).astype(np.uint8)
     rv = get_largest_cc(rv).astype(np.uint8)
     pixel_thres = 10
     if np.sum(epi) < pixel_thres or np.sum(rv) < pixel_thres:
@@ -135,58 +142,56 @@ def sa_pass_quality_control(seg_sa_name):
     return True
 
 
-def la_pass_quality_control(seg_la_name):
-    """ Quality control for long-axis image segmentation """
-    nim = nib.load(seg_la_name)
-    seg = nim.get_data()
-    X, Y, Z = seg.shape[:3]
-    seg_z = seg[:, :, 0]
+# def la_pass_quality_control(seg_la_name):
+#     """ Quality control for long-axis image segmentation """
+#     nim = nib.load(seg_la_name)
+#     seg = nim.get_data()
+#     X, Y, Z = seg.shape[:3]
+#     seg_z = seg[:, :, 0]
 
-    # Label class in the segmentation
-    label = {'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
+#     # Label class in the segmentation
+#     label = {'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
 
-    for l_name, l in label.items():
-        # Criterion 1: every class exists and the area is above a threshold
-        pixel_thres = 10
-        if np.sum(seg_z == l) < pixel_thres:
-            print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
-                  'It does not pass the quality control.'.format(seg_la_name, l_name, pixel_thres))
-            return False
+#     for l_name, l in label.items():
+#         # Criterion 1: every class exists and the area is above a threshold
+#         pixel_thres = 10
+#         if np.sum(seg_z == l) < pixel_thres:
+#             print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
+#                   'It does not pass the quality control.'.format(seg_la_name, l_name, pixel_thres))
+#             return False
 
-    # Criterion 2: the area is above a threshold after connected component analysis
-    endo = (seg_z == label['LV']).astype(np.uint8)
-    endo = get_largest_cc(endo).astype(np.uint8)
-    myo = (seg_z == label['Myo']).astype(np.uint8)
-    myo = remove_small_cc(myo).astype(np.uint8)
-    epi = (endo | myo).astype(np.uint8)
-    epi = get_largest_cc(epi).astype(np.uint8)
-    pixel_thres = 10
-    if np.sum(endo) < pixel_thres or np.sum(myo) < pixel_thres or np.sum(epi) < pixel_thres:
-        print('{0}: Can not find LV endo, myo or epi to extract the long-axis '
-              'myocardial contour.'.format(seg_la_name))
-        return False
-    return True
+#     # Criterion 2: the area is above a threshold after connected component analysis
+#     endo = (seg_z == label['LV']).astype(np.uint8)
+#     endo = get_largest_cc(endo).astype(np.uint8)
+#     myo = (seg_z == label['Myo']).astype(np.uint8)
+#     myo = remove_small_cc(myo).astype(np.uint8)
+#     epi = (endo | myo).astype(np.uint8)
+#     epi = get_largest_cc(epi).astype(np.uint8)
+#     pixel_thres = 10
+#     if np.sum(endo) < pixel_thres or np.sum(myo) < pixel_thres or np.sum(epi) < pixel_thres:
+#         print('{0}: Can not find LV endo, myo or epi to extract the long-axis '
+#               'myocardial contour.'.format(seg_la_name))
+#         return False
+#     return True
 
 
 def determine_aha_coordinate_system(seg_sa, affine_sa):
     """ Determine the AHA coordinate system using the mid-cavity slice
         of the short-axis image segmentation.
         """
-    # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 4}
 
     # Find the mid-cavity slice
-    _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == label['LV'])]
+    _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == LABEL['LV'])]
     z = int(round(cz))
     seg_z = seg_sa[:, :, z]
 
-    endo = (seg_z == label['LV']).astype(np.uint8)
+    endo = (seg_z == LABEL['LV']).astype(np.uint8)
     endo = get_largest_cc(endo).astype(np.uint8)
-    myo = (seg_z == label['Myo']).astype(np.uint8)
+    myo = (seg_z == LABEL['Myo']).astype(np.uint8)
     myo = remove_small_cc(myo).astype(np.uint8)
     epi = (endo | myo).astype(np.uint8)
     epi = get_largest_cc(epi).astype(np.uint8)
-    rv = (seg_z == label['RV']).astype(np.uint8)
+    rv = (seg_z == LABEL['RV']).astype(np.uint8)
     rv = get_largest_cc(rv).astype(np.uint8)
 
     # Extract epicardial contour
@@ -227,8 +232,6 @@ def determine_aha_coordinate_system(seg_sa, affine_sa):
 
 def determine_aha_part(seg_sa, affine_sa, three_slices=False):
     """ Determine the AHA part for each slice. """
-    # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3}
 
     # Sort the z-axis positions of the slices with both endo and epicardium
     # segmentations
@@ -236,8 +239,8 @@ def determine_aha_part(seg_sa, affine_sa, three_slices=False):
     z_pos = []
     for z in range(Z):
         seg_z = seg_sa[:, :, z]
-        endo = (seg_z == label['LV']).astype(np.uint8)
-        myo = (seg_z == label['Myo']).astype(np.uint8)
+        endo = (seg_z == LABEL['LV']).astype(np.uint8)
+        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
         pixel_thres = 10
         if (np.sum(endo) < pixel_thres) or (np.sum(myo) < pixel_thres):
             continue
@@ -354,16 +357,19 @@ def determine_aha_segment_id(point, lv_centre, aha_axis, part):
     return seg_id
 
 
-def evaluate_wall_thickness(seg_name, output_name_stem, part=None):
+def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
     """ Evaluate myocardial wall thickness. """
     # Read the segmentation image
     nim = nib.load(seg_name)
     Z = nim.header['dim'][3]
     affine = nim.affine
     seg = nim.get_data()
+    seg = seg.squeeze()
 
-    # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3}
+    if fix:
+        im_z = seg[:, :, 24]
+        im_z[im_z == 2] = 1
+        seg[:, :, 24] = im_z
 
     # Determine the AHA coordinate system using the mid-cavity slice
     aha_axis = determine_aha_coordinate_system(seg, affine)
@@ -399,9 +405,9 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None):
         # e.g. a single pixel, which either means the structure is missing or
         # causes problem in contour interpolation.
         seg_z = seg[:, :, z]
-        endo = (seg_z == label['LV']).astype(np.uint8)
+        endo = (seg_z == LABEL['LV']).astype(np.uint8)
         endo = get_largest_cc(endo).astype(np.uint8)
-        myo = (seg_z == label['Myo']).astype(np.uint8)
+        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
         myo = remove_small_cc(myo).astype(np.uint8)
         epi = (endo | myo).astype(np.uint8)
         epi = get_largest_cc(epi).astype(np.uint8)
@@ -526,14 +532,17 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None):
 
     # Evaluate the wall thickness per AHA segment and save to a csv file
     table_thickness = np.zeros(17)
+    table_thickness_med = np.zeros(17)
     table_thickness_max = np.zeros(17)
     np_thickness = numpy_support.vtk_to_numpy(thickness).astype(np.float32)
     np_points_aha = numpy_support.vtk_to_numpy(points_aha).astype(np.int8)
 
     for i in range(16):
         table_thickness[i] = np.mean(np_thickness[np_points_aha == (i + 1)])
+        table_thickness_med[i] = np.median(np_thickness[np_points_aha == (i + 1)])
         table_thickness_max[i] = np.max(np_thickness[np_points_aha == (i + 1)])
     table_thickness[-1] = np.mean(np_thickness)
+    table_thickness[-1] = np.median(np_thickness)
     table_thickness_max[-1] = np.max(np_thickness)
 
     index = [str(x) for x in np.arange(1, 17)] + ['Global']
@@ -542,6 +551,9 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None):
 
     df = pd.DataFrame(table_thickness_max, index=index, columns=['Thickness_Max'])
     df.to_csv('{0}_max.csv'.format(output_name_stem))
+
+    df = pd.DataFrame(table_thickness_med, index=index, columns=['Thickness_Med'])
+    df.to_csv('{0}_med.csv'.format(output_name_stem))
 
 
 def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_slices=False):
@@ -557,9 +569,7 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
     X, Y, Z = nim.header['dim'][1:4]
     affine = nim.affine
     seg = nim.get_data()
-
-    # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3}
+    seg = seg.squeeze()
 
     # Determine the AHA coordinate system using the mid-cavity slice
     aha_axis = determine_aha_coordinate_system(seg, affine)
@@ -575,9 +585,9 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
     for z in range(Z):
         # Check whether there is the endocardial segmentation
         seg_z = seg[:, :, z]
-        endo = (seg_z == label['LV']).astype(np.uint8)
+        endo = (seg_z == LABEL['LV']).astype(np.uint8)
         endo = get_largest_cc(endo).astype(np.uint8)
-        myo = (seg_z == label['Myo']).astype(np.uint8)
+        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
         myo = remove_small_cc(myo).astype(np.uint8)
         epi = (endo | myo).astype(np.uint8)
         epi = get_largest_cc(epi).astype(np.uint8)
@@ -860,9 +870,6 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
     split_volume('{0}/sa_crop.nii.gz'.format(output_dir), '{0}/sa_crop_z'.format(output_dir))
     split_volume('{0}/seg_sa_crop.nii.gz'.format(output_dir), '{0}/seg_sa_crop_z'.format(output_dir))
 
-    # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3}
-
     # Inter-frame motion estimation
     nim = nib.load('{0}/sa_crop.nii.gz'.format(output_dir))
     Z = nim.header['dim'][3]
@@ -1036,7 +1043,7 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
         along the long-axis and determine the part for each index.
     """
     # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
+    # label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 4} # , 'LA': 4, 'RA': 5}
 
     # Sort the left ventricle and myocardium points according to their long-axis locations
     lv_myo_points = []
@@ -1044,7 +1051,7 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
     z = 0
     for y in range(Y):
         for x in range(X):
-            if seg_la[x, y] == label['LV'] or seg_la[x, y] == label['Myo']:
+            if seg_la[x, y] == LABEL['LV'] or seg_la[x, y] == LABEL['Myo']:
                 z_sa = np.dot(np.linalg.inv(affine_sa), np.dot(affine_la, np.array([x, y, z, 1])))[2]
                 la_idx = int(round(z_sa * 2))
                 lv_myo_points += [[x, y, la_idx]]
@@ -1081,7 +1088,7 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
     z = 0
     for y in range(Y):
         for x in range(X):
-            if seg_la[x, y] == label['LV']:
+            if seg_la[x, y] == LABEL['LV']:
                 z_sa = np.dot(np.linalg.inv(affine_sa), np.dot(affine_la, np.array([x, y, z, 1])))[2]
                 la_idx = int(round(z_sa * 2))
                 lv_points += [[x, y, la_idx]]
@@ -1146,12 +1153,13 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
     seg = nim.get_data()
 
     # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
+    # label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 4} # , 'LA': 4, 'RA': 5}
 
     # Determine the AHA coordinate system using the mid-cavity slice of short-axis images
     nim_sa = nib.load(seg_sa_name)
     affine_sa = nim_sa.affine
     seg_sa = nim_sa.get_data()
+    seg_sa = seg_sa.squeeze()
     aha_axis = determine_aha_coordinate_system(seg_sa, affine_sa)
 
     # Construct the points set and data arrays to represent both endo and epicardial contours
@@ -1174,12 +1182,12 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
     # Only keep the largest connected component
     z = 0
     seg_z = seg[:, :, z]
-    endo = (seg_z == label['LV']).astype(np.uint8)
+    endo = (seg_z == LABEL['LV']).astype(np.uint8)
     endo = get_largest_cc(endo).astype(np.uint8)
     # The myocardium may be split to two parts due to the very thin apex.
     # So we do not apply get_largest_cc() to it. However, we remove small pieces, which
     # may cause problems in determining the contours.
-    myo = (seg_z == label['Myo']).astype(np.uint8)
+    myo = (seg_z == LABEL['Myo']).astype(np.uint8)
     myo = remove_small_cc(myo).astype(np.uint8)
     epi = (endo | myo).astype(np.uint8)
     epi = get_largest_cc(epi).astype(np.uint8)
@@ -1438,7 +1446,7 @@ def cine_2d_la_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
     dt = nim.header['pixdim'][4]
 
     # Label class in the segmentation
-    label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
+    # label = {'BG': 0, 'LV': 1, 'Myo': 2, 'RV': 4} # , 'LA': 4, 'RA': 5}
 
     # Split the cine sequence
     split_sequence('{0}/la_4ch_crop.nii.gz'.format(output_dir),

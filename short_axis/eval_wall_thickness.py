@@ -20,7 +20,7 @@ import sys
 import sys
 sys.path.insert(0, 'P:\\GitHub')
 
-from ukbb_cardiac.common.cardiac_utils import *
+from ukbb_cardiac.common.cardiac_utils import sa_pass_quality_control, evaluate_wall_thickness
 
 
 if __name__ == '__main__':
@@ -31,38 +31,87 @@ if __name__ == '__main__':
 
     data_path = args.data_dir
     data_list = sorted(os.listdir(data_path))
-    table = []
+    
     processed_list = []
     for data in data_list:
         print(data)
         data_dir = os.path.join(data_path, data)
+
+        if not os.path.isdir(data_dir):
+            continue
+
+        # Fix the section Z=24 for this subject
+        if data == '12MN01211_manual_3':
+            fix = True
+        else:
+            fix = False
 
         # Quality control for segmentation at ED
         # If the segmentation quality is low, evaluation of wall thickness may fail.
         seg_sa_name = '{0}/seg_lvsa_SR_ED.nii.gz'.format(data_dir)  # seg_sa_ED
         if not os.path.exists(seg_sa_name):
             print('File does not exist')
-        if not sa_pass_quality_control(seg_sa_name):
+        if not sa_pass_quality_control(seg_sa_name, fix=fix):
             print('Not pass SA quality control')
             continue
 
         # Evaluate myocardial wall thickness
         evaluate_wall_thickness('{0}/seg_lvsa_SR_ED.nii.gz'.format(data_dir),
-                                '{0}/wall_thickness_ED'.format(data_dir))
+                                '{0}/wall_thickness_ED'.format(data_dir),
+                                fix=fix)
 
-        # Record data
+        processed_list += [data]
+
+    # Record data
+    table_mean = []
+    table_median = []
+    table_max = []
+    for data in processed_list:
+        print(data)
+        data_dir = os.path.join(data_path, data)
+
         if os.path.exists('{0}/wall_thickness_ED.csv'.format(data_dir)):
             df = pd.read_csv('{0}/wall_thickness_ED.csv'.format(data_dir), index_col=0)
             line = df['Thickness'].values
-            table += [line]
-            processed_list += [data]
+            table_mean += [line]
+
+        if os.path.exists('{0}/wall_thickness_ED_med.csv'.format(data_dir)):
+            df = pd.read_csv('{0}/wall_thickness_ED_med.csv'.format(data_dir), index_col=0)
+            line = df['Thickness_Med'].values
+            table_median += [line]
+
+        if os.path.exists('{0}/wall_thickness_ED_med.csv'.format(data_dir)):
+            df = pd.read_csv('{0}/wall_thickness_ED_max.csv'.format(data_dir), index_col=0)
+            line = df['Thickness_Max'].values
+            table_max += [line]
+        
 
     # Save wall thickness for all the subjects
-    df = pd.DataFrame(table, index=processed_list,
-                      columns=['WT_AHA_1 (mm)', 'WT_AHA_2 (mm)', 'WT_AHA_3 (mm)',
-                               'WT_AHA_4 (mm)', 'WT_AHA_5 (mm)', 'WT_AHA_6 (mm)',
-                               'WT_AHA_7 (mm)', 'WT_AHA_8 (mm)', 'WT_AHA_9 (mm)',
-                               'WT_AHA_10 (mm)', 'WT_AHA_11 (mm)', 'WT_AHA_12 (mm)',
-                               'WT_AHA_13 (mm)', 'WT_AHA_14 (mm)', 'WT_AHA_15 (mm)', 'WT_AHA_16 (mm)',
-                               'WT_Global (mm)'])
-    df.to_csv(args.output_csv)
+    df = pd.DataFrame(table_mean, index=processed_list,
+                    columns=['WT_AHA_1 (mm)', 'WT_AHA_2 (mm)', 'WT_AHA_3 (mm)',
+                            'WT_AHA_4 (mm)', 'WT_AHA_5 (mm)', 'WT_AHA_6 (mm)',
+                            'WT_AHA_7 (mm)', 'WT_AHA_8 (mm)', 'WT_AHA_9 (mm)',
+                            'WT_AHA_10 (mm)', 'WT_AHA_11 (mm)', 'WT_AHA_12 (mm)',
+                            'WT_AHA_13 (mm)', 'WT_AHA_14 (mm)', 'WT_AHA_15 (mm)', 'WT_AHA_16 (mm)',
+                            'WT_Global (mm)'])
+    df.to_csv(args.output_csv + '_mean.csv')
+
+    # Save wall thickness for all the subjects
+    df = pd.DataFrame(table_median, index=processed_list,
+                    columns=['WT_AHA_1 (mm)', 'WT_AHA_2 (mm)', 'WT_AHA_3 (mm)',
+                            'WT_AHA_4 (mm)', 'WT_AHA_5 (mm)', 'WT_AHA_6 (mm)',
+                            'WT_AHA_7 (mm)', 'WT_AHA_8 (mm)', 'WT_AHA_9 (mm)',
+                            'WT_AHA_10 (mm)', 'WT_AHA_11 (mm)', 'WT_AHA_12 (mm)',
+                            'WT_AHA_13 (mm)', 'WT_AHA_14 (mm)', 'WT_AHA_15 (mm)', 'WT_AHA_16 (mm)',
+                            'WT_Global (mm)'])
+    df.to_csv(args.output_csv + '_median.csv')
+
+    # Save wall thickness for all the subjects
+    df = pd.DataFrame(table_max, index=processed_list,
+                    columns=['WT_AHA_1 (mm)', 'WT_AHA_2 (mm)', 'WT_AHA_3 (mm)',
+                            'WT_AHA_4 (mm)', 'WT_AHA_5 (mm)', 'WT_AHA_6 (mm)',
+                            'WT_AHA_7 (mm)', 'WT_AHA_8 (mm)', 'WT_AHA_9 (mm)',
+                            'WT_AHA_10 (mm)', 'WT_AHA_11 (mm)', 'WT_AHA_12 (mm)',
+                            'WT_AHA_13 (mm)', 'WT_AHA_14 (mm)', 'WT_AHA_15 (mm)', 'WT_AHA_16 (mm)',
+                            'WT_Global (mm)'])
+    df.to_csv(args.output_csv + '_max.csv')
