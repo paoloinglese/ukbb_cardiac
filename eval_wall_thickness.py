@@ -16,6 +16,8 @@ import os
 import argparse
 import pandas as pd
 from tqdm import tqdm
+import sys
+sys.path.insert(0, 'P:\\GitHub')
 
 from ukbb_cardiac.common.cardiac_utils import sa_pass_quality_control, evaluate_wall_thickness
 
@@ -44,6 +46,17 @@ if __name__ == '__main__':
         if not os.path.isdir(data_dir):
             continue
 
+        # if os.path.isfile(os.path.join(data_path, '_CHECK_SEG_QC_ED.txt')):
+        #     print(data)
+        #     print('Segmentation did not pass QC. Skipping.')
+        #     continue
+
+        # Fix the section Z=24 for this subject
+        if data == '12MN01211_manual_3':
+            fix = True
+        else:
+            fix = False
+
         # Quality control for segmentation at ED
         # If the segmentation quality is low, evaluation of wall thickness may fail.
         seg_sa_name = '{0}/LVSA_seg_ED.nii.gz'.format(data_dir)  # seg_sa_ED
@@ -52,7 +65,7 @@ if __name__ == '__main__':
             print('File does not exist')
             continue
 
-        if not sa_pass_quality_control(seg_sa_name):
+        if not sa_pass_quality_control(seg_sa_name, fix=fix):
             print(data)
             print('Not pass SA quality control')
             continue

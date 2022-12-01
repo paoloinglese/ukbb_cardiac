@@ -21,12 +21,12 @@ import vtk
 import pandas as pd
 import matplotlib.pyplot as plt
 from vtk.util import numpy_support
-from scipy import interpolate
+from scipy import interpolate, stats
 import skimage
 from ukbb_cardiac.common.image_utils import *
 
 
-LABEL = {'LV': 1, 'Myo': 2, 'RV': 4}
+LABEL = {'LV': 1, 'Myo': 2, 'RV': 3}  # 'RV': 4 for rbh, 3 for ukb
 
 
 def approximate_contour(contour, factor=4, smooth=0.05, periodic=False):
@@ -55,13 +55,16 @@ def approximate_contour(contour, factor=4, smooth=0.05, periodic=False):
     # Pad the contour before approximation to avoid underestimating
     # the values at the end points
     r = int(0.5 * N)
-    t_pad = np.concatenate((np.arange(-r, 0) * dt, t, 1 + np.arange(0, r) * dt))
+    t_pad = np.concatenate(
+        (np.arange(-r, 0) * dt, t, 1 + np.arange(0, r) * dt))
     if periodic:
         x_pad = np.concatenate((x[-r:], x, x[:r]))
         y_pad = np.concatenate((y[-r:], y, y[:r]))
     else:
-        x_pad = np.concatenate((np.repeat(x[0], repeats=r), x, np.repeat(x[-1], repeats=r)))
-        y_pad = np.concatenate((np.repeat(y[0], repeats=r), y, np.repeat(y[-1], repeats=r)))
+        x_pad = np.concatenate(
+            (np.repeat(x[0], repeats=r), x, np.repeat(x[-1], repeats=r)))
+        y_pad = np.concatenate(
+            (np.repeat(y[0], repeats=r), y, np.repeat(y[-1], repeats=r)))
 
     # Fit the contour with splines with a smoothness constraint
     fx = interpolate.UnivariateSpline(t_pad, x_pad, s=smooth * len(t_pad))
@@ -76,126 +79,123 @@ def approximate_contour(contour, factor=4, smooth=0.05, periodic=False):
     return contour2
 
 
-def sa_pass_quality_control(seg_sa_name, fix=False):
+def get_refined_seg(seg_slice):
+    endo = get_largest_cc(seg_slice == LABEL['LV']).astype(np.uint8)
+    myo = remove_small_cc(seg_slice == LABEL['Myo']).astype(np.uint8)
+    epi = get_largest_cc((endo | myo)).astype(np.uint8)
+    rv = get_largest_cc(seg_slice == LABEL['RV']).astype(np.uint8)
+    if np.sum(rv) == 0:
+        rv = get_largest_cc(seg_slice == 4).astype(np.uint8)
+    return {'endo': endo, 'myo': myo, 'epi': epi, 'rv': rv}
+
+
+def sa_pass_quality_control(seg_sa_name, minimum_volume=10,
+                            minimum_n_slices=6, minimum_epi_rv=10):
     """ Quality control for short-axis image segmentation """
     nim = nib.load(seg_sa_name)
     seg_sa = nim.get_data()
-    seg_sa = seg_sa.squeeze()
-    X, Y, Z = seg_sa.shape[:3]
-
-    if fix:
-        im_z = seg_sa[:, :, 24]
-        im_z[im_z == 2] = 1
-        seg_sa[:, :, 24] = im_z
-
+    if len(seg_sa.shape) > 3:
+        seg_sa = seg_sa.squeeze()
+    _, _, Z = seg_sa.shape[:3]
 
     # Criterion 1: every class exists and the area is above a threshold
     # Count number of pixels in 3D
     for l_name, l in LABEL.items():
-        pixel_thres = 10
-        if np.sum(seg_sa == l) < pixel_thres:
-            print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
-                  'It does not pass the quality control.'.format(seg_sa_name, l_name, pixel_thres))
+        if l_name == 'RV' and np.sum(seg_sa == l) < minimum_volume:
+            # try with RV = 4
+            l = 4
+        if np.sum(seg_sa == l) < minimum_volume:
+            print(
+                '{0}: The segmentation for class {1} is smaller than {2} ' +
+                'pixels. It does not pass the quality control.'.format(
+                    seg_sa_name, l_name, minimum_volume))
             return False
 
     # Criterion 2: number of slices with LV segmentations is above a threshold
     # and there is no missing segmentation in between the slices
-    z_pos = []
-    for z in range(Z):
-        seg_z = seg_sa[:, :, z]
-        endo = (seg_z == LABEL['LV']).astype(np.uint8)
-        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
-        pixel_thres = 10
-        if (np.sum(endo) < pixel_thres) or (np.sum(myo) < pixel_thres):
-            continue
-        z_pos += [z]
-    n_slice = len(z_pos)
-    slice_thres = 6
-    if n_slice < slice_thres:
-        print('{0}: The segmentation has less than {1} slices. '
-              'It does not pass the quality control.'.format(seg_sa_name, slice_thres))
+
+    def check_npix_myo_lv(seg_slice, pixel_thres=10):
+        endo = seg_slice == LABEL['LV']
+        myo = seg_slice == LABEL['Myo']
+        return (np.sum(endo) >= pixel_thres) and (np.sum(myo) >= pixel_thres)
+
+    z_pass = np.asarray([check_npix_myo_lv(seg_sa[:, :, z]) for z in range(Z)])
+
+    if np.sum(z_pass) < minimum_n_slices:
+        print('{0}: The segmentation has less than {1} slices. ' +
+              'It does not pass the quality control.'.format(
+                  seg_sa_name, minimum_n_slices))
         return False
 
-    if n_slice != (np.max(z_pos) - np.min(z_pos) + 1):
-        print('{0}: There is missing segmentation between the slices. '
+    if np.any(np.diff(z_pass) > 1):
+        print('{0}: The segmented areas are not contiguous along Z. ' +
               'It does not pass the quality control.'.format(seg_sa_name))
         return False
 
     # Criterion 3: LV and RV exists on the mid-cavity slice
     _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == LABEL['LV'])]
-    z = int(round(cz))
-    seg_z = seg_sa[:, :, z]
 
-    endo = (seg_z == LABEL['LV']).astype(np.uint8)
+    seg_mid_z = seg_sa[:, :, int(round(cz))]
+    ref_seg = get_refined_seg(seg_mid_z)
+
+    if np.sum(ref_seg['epi']) < minimum_epi_rv or \
+            np.sum(ref_seg['rv']) < minimum_epi_rv:
+        print('{0}: Can not find LV epi or RV to determine the AHA ' +
+              'coordinate system.'.format(seg_sa_name))
+        return False
+
+    return True
+
+
+def la_pass_quality_control(seg_la_name):
+    """ Quality control for long-axis image segmentation """
+    nim = nib.load(seg_la_name)
+    seg = nim.get_data()
+    X, Y, Z = seg.shape[:3]
+    seg_z = seg[:, :, 0]
+
+    # Label class in the segmentation
+    label = {'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
+
+    for l_name, l in label.items():
+        # Criterion 1: every class exists and the area is above a threshold
+        pixel_thres = 10
+        if np.sum(seg_z == l) < pixel_thres:
+            print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
+                  'It does not pass the quality control.'.format(seg_la_name, l_name, pixel_thres))
+            return False
+
+    # Criterion 2: the area is above a threshold after connected component analysis
+    endo = (seg_z == label['LV']).astype(np.uint8)
     endo = get_largest_cc(endo).astype(np.uint8)
-    myo = (seg_z == LABEL['Myo']).astype(np.uint8)
+    myo = (seg_z == label['Myo']).astype(np.uint8)
     myo = remove_small_cc(myo).astype(np.uint8)
     epi = (endo | myo).astype(np.uint8)
     epi = get_largest_cc(epi).astype(np.uint8)
-    rv = (seg_z == LABEL['RV']).astype(np.uint8)
-    rv = get_largest_cc(rv).astype(np.uint8)
     pixel_thres = 10
-    if np.sum(epi) < pixel_thres or np.sum(rv) < pixel_thres:
-        print('{0}: Can not find LV epi or RV to determine the AHA '
-              'coordinate system.'.format(seg_sa_name))
+    if np.sum(endo) < pixel_thres or np.sum(myo) < pixel_thres or np.sum(epi) < pixel_thres:
+        print('{0}: Can not find LV endo, myo or epi to extract the long-axis '
+              'myocardial contour.'.format(seg_la_name))
         return False
     return True
 
 
-# def la_pass_quality_control(seg_la_name):
-#     """ Quality control for long-axis image segmentation """
-#     nim = nib.load(seg_la_name)
-#     seg = nim.get_data()
-#     X, Y, Z = seg.shape[:3]
-#     seg_z = seg[:, :, 0]
-
-#     # Label class in the segmentation
-#     label = {'LV': 1, 'Myo': 2, 'RV': 3, 'LA': 4, 'RA': 5}
-
-#     for l_name, l in label.items():
-#         # Criterion 1: every class exists and the area is above a threshold
-#         pixel_thres = 10
-#         if np.sum(seg_z == l) < pixel_thres:
-#             print('{0}: The segmentation for class {1} is smaller than {2} pixels. '
-#                   'It does not pass the quality control.'.format(seg_la_name, l_name, pixel_thres))
-#             return False
-
-#     # Criterion 2: the area is above a threshold after connected component analysis
-#     endo = (seg_z == label['LV']).astype(np.uint8)
-#     endo = get_largest_cc(endo).astype(np.uint8)
-#     myo = (seg_z == label['Myo']).astype(np.uint8)
-#     myo = remove_small_cc(myo).astype(np.uint8)
-#     epi = (endo | myo).astype(np.uint8)
-#     epi = get_largest_cc(epi).astype(np.uint8)
-#     pixel_thres = 10
-#     if np.sum(endo) < pixel_thres or np.sum(myo) < pixel_thres or np.sum(epi) < pixel_thres:
-#         print('{0}: Can not find LV endo, myo or epi to extract the long-axis '
-#               'myocardial contour.'.format(seg_la_name))
-#         return False
-#     return True
-
-
 def determine_aha_coordinate_system(seg_sa, affine_sa):
-    """ Determine the AHA coordinate system using the mid-cavity slice
-        of the short-axis image segmentation.
-        """
+    """
+    Determine the AHA coordinate system using the mid-cavity slice of the
+    short-axis image segmentation.
+    """
 
     # Find the mid-cavity slice
     _, _, cz = [np.mean(x) for x in np.nonzero(seg_sa == LABEL['LV'])]
     z = int(round(cz))
     seg_z = seg_sa[:, :, z]
 
-    endo = (seg_z == LABEL['LV']).astype(np.uint8)
-    endo = get_largest_cc(endo).astype(np.uint8)
-    myo = (seg_z == LABEL['Myo']).astype(np.uint8)
-    myo = remove_small_cc(myo).astype(np.uint8)
-    epi = (endo | myo).astype(np.uint8)
-    epi = get_largest_cc(epi).astype(np.uint8)
-    rv = (seg_z == LABEL['RV']).astype(np.uint8)
-    rv = get_largest_cc(rv).astype(np.uint8)
+    ref_seg = get_refined_seg(seg_z)
 
     # Extract epicardial contour
-    contours, _ = cv2.findContours(cv2.inRange(epi, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(cv2.inRange(ref_seg['epi'], 1, 1),
+                                   cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     epi_contour = contours[0][:, 0, :]
 
     # Find the septum, which is the intersection between LV and RV
@@ -204,7 +204,8 @@ def determine_aha_coordinate_system(seg_sa, affine_sa):
     while len(septum) == 0:
         # Dilate the RV till it intersects with LV epicardium.
         # Normally, this is fulfilled after just one iteration.
-        rv_dilate = cv2.dilate(rv, np.ones((3, 3), dtype=np.uint8), iterations=dilate_iter)
+        rv_dilate = cv2.dilate(ref_seg['rv'], np.ones((3, 3), dtype=np.uint8),
+                               iterations=dilate_iter)
         dilate_iter += 1
         for y, x in epi_contour:
             if rv_dilate[x, y] == 1:
@@ -212,11 +213,11 @@ def determine_aha_coordinate_system(seg_sa, affine_sa):
 
     # The middle of the septum
     mx, my = septum[int(round(0.5 * len(septum)))]
-    point_septum = np.dot(affine_sa, np.array([mx, my, z, 1]))[:3]
+    point_septum = affine_sa.dot([mx, my, z, 1])[:3]
 
     # Find the centre of the LV cavity
-    cx, cy = [np.mean(x) for x in np.nonzero(endo)]
-    point_cavity = np.dot(affine_sa, np.array([cx, cy, z, 1]))[:3]
+    cx, cy = [np.mean(x) for x in np.nonzero(ref_seg['endo'])]
+    point_cavity = affine_sa.dot([cx, cy, z, 1])[:3]
 
     # Determine the AHA coordinate system
     axis = {}
@@ -231,20 +232,23 @@ def determine_aha_coordinate_system(seg_sa, affine_sa):
 
 
 def determine_aha_part(seg_sa, affine_sa, three_slices=False):
-    """ Determine the AHA part for each slice. """
+    """
+    Determine the AHA part for each slice.
+    """
 
     # Sort the z-axis positions of the slices with both endo and epicardium
     # segmentations
     X, Y, Z = seg_sa.shape[:3]
     z_pos = []
-    for z in range(Z):
-        seg_z = seg_sa[:, :, z]
-        endo = (seg_z == LABEL['LV']).astype(np.uint8)
-        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
-        pixel_thres = 10
-        if (np.sum(endo) < pixel_thres) or (np.sum(myo) < pixel_thres):
-            continue
-        z_pos += [(z, np.dot(affine_sa, np.array([X / 2.0, Y / 2.0, z, 1]))[2])]
+
+    def check_npix_lv_myo(seg_slice, pixel_thres=10):
+        endo = seg_slice == LABEL['LV']
+        myo = seg_slice == LABEL['Myo']
+        return (np.sum(endo) >= pixel_thres) and (np.sum(myo) >= pixel_thres)
+
+    z_pos = [(z, affine_sa.dot([X / 2.0, Y / 2.0, z, 1])[2])
+             for z in range(Z) if check_npix_lv_myo(seg_sa[:, :, z])]
+
     z_pos = sorted(z_pos, key=lambda x: -x[1])
 
     # Divide the slices into three parts: basal, mid-cavity and apical
@@ -296,9 +300,11 @@ def determine_aha_part(seg_sa, affine_sa, three_slices=False):
 
 
 def determine_aha_segment_id(point, lv_centre, aha_axis, part):
-    """ Determine the AHA segment ID given a point,
-        the LV cavity center and the coordinate system.
-        """
+    """
+    Determine the AHA segment ID given a point, the LV cavity center and the
+    coordinate system.
+    """
+
     d = point - lv_centre
     x = np.dot(d, aha_axis['inf_to_ant'])
     y = np.dot(d, aha_axis['lv_to_sep'])
@@ -357,14 +363,17 @@ def determine_aha_segment_id(point, lv_centre, aha_axis, part):
     return seg_id
 
 
-def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
+def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False,
+                            save_epi_contour=True):
     """ Evaluate myocardial wall thickness. """
+
     # Read the segmentation image
     nim = nib.load(seg_name)
     Z = nim.header['dim'][3]
     affine = nim.affine
     seg = nim.get_data()
-    seg = seg.squeeze()
+    if len(seg.shape) == 4:
+        seg = seg.squeeze()
 
     if fix:
         im_z = seg[:, :, 24]
@@ -391,7 +400,6 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
     lines = vtk.vtkCellArray()
 
     # Save epicardial contour for debug and demonstration purposes
-    save_epi_contour = False
     if save_epi_contour:
         epi_points = vtk.vtkPoints()
         points_epi_aha = vtk.vtkIntArray()
@@ -405,29 +413,27 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
         # e.g. a single pixel, which either means the structure is missing or
         # causes problem in contour interpolation.
         seg_z = seg[:, :, z]
-        endo = (seg_z == LABEL['LV']).astype(np.uint8)
-        endo = get_largest_cc(endo).astype(np.uint8)
-        myo = (seg_z == LABEL['Myo']).astype(np.uint8)
-        myo = remove_small_cc(myo).astype(np.uint8)
-        epi = (endo | myo).astype(np.uint8)
-        epi = get_largest_cc(epi).astype(np.uint8)
+        ref_seg = get_refined_seg(seg_z)
         pixel_thres = 10
-        if (np.sum(endo) < pixel_thres) or (np.sum(myo) < pixel_thres):
+        if (np.sum(ref_seg['endo']) < pixel_thres) or \
+                (np.sum(ref_seg['myo']) < pixel_thres):
             continue
 
         # Calculate the centre of the LV cavity
         # Get the largest component in case we have a bad segmentation
-        cx, cy = [np.mean(x) for x in np.nonzero(endo)]
-        lv_centre = np.dot(affine, np.array([cx, cy, z, 1]))[:3]
+        cx, cy = [np.mean(x) for x in np.nonzero(ref_seg['endo'])]
+        lv_centre = affine.dot([cx, cy, z, 1])[:3]
 
         # Extract endocardial contour
-        # Note: cv2 considers an input image as a Y x X array, which is different
-        # from nibabel which assumes a X x Y array.
-        contours, _ = cv2.findContours(cv2.inRange(endo, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        # Note: cv2 considers an input image as a Y x X array, which is
+        # different from nibabel which assumes a X x Y array.
+        contours, _ = cv2.findContours(cv2.inRange(ref_seg['endo'], 1, 1),
+                                       cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         endo_contour = contours[0][:, 0, :]
 
         # Extract epicardial contour
-        contours, _ = cv2.findContours(cv2.inRange(epi, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        contours, _ = cv2.findContours(cv2.inRange(ref_seg['epi'], 1, 1),
+                                       cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         epi_contour = contours[0][:, 0, :]
 
         # Smooth the contours
@@ -437,7 +443,7 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
         # A polydata representation of the epicardial contour
         epi_points_z = vtk.vtkPoints()
         for y, x in epi_contour:
-            p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+            p = affine.dot([x, y, z, 1])[:3]
             epi_points_z.InsertNextPoint(p)
         epi_poly_z = vtk.vtkPolyData()
         epi_poly_z.SetPoints(epi_points_z)
@@ -447,14 +453,18 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
         locator.SetDataSet(epi_poly_z)
         locator.BuildLocator()
 
+        for y, x in endo_contour:
+            p = affine.dot([x, y, z, 1])[:3]
+            endo_points.InsertNextPoint(p)
+
         # For each point on endocardium, find the closest point on epicardium
         N = endo_contour.shape[0]
+
         for i in range(N):
             y, x = endo_contour[i]
 
             # The world coordinate of this point
-            p = np.dot(affine, np.array([x, y, z, 1]))[:3]
-            endo_points.InsertNextPoint(p)
+            p = affine.dot([x, y, z, 1])[:3]
 
             # The closest epicardial point
             q = np.array(epi_points_z.GetPoint(locator.FindClosestPoint(p)))
@@ -462,9 +472,19 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
             # The distance from endo to epi
             dist_pq = np.linalg.norm(q - p)
 
-            # Add the point data
-            thickness.InsertNextTuple1(dist_pq)
-            seg_id = determine_aha_segment_id(p, lv_centre, aha_axis, part_z[z])
+            # Check that the closest point is not beyond the center of the
+            # section
+            dist_p_center = np.linalg.norm(lv_centre - p)
+            # Check also that the epi point is farther from the center than the
+            # endo point - concentricity
+            dist_q_center = np.linalg.norm(lv_centre - q)
+            if dist_p_center <= dist_q_center and dist_pq < dist_q_center:
+                thickness.InsertNextTuple1(dist_pq)
+            else:
+                thickness.InsertNextTuple1(np.nan)
+
+            seg_id = determine_aha_segment_id(
+                p, lv_centre, aha_axis, part_z[z])
             points_aha.InsertNextTuple1(seg_id)
 
             # Record the first point of the current contour
@@ -487,9 +507,10 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
                 y, x = epi_contour[i]
 
                 # The world coordinate of this point
-                p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+                p = affine.dot([x, y, z, 1])[:3]
                 epi_points.InsertNextPoint(p)
-                seg_id = determine_aha_segment_id(p, lv_centre, aha_axis, part_z[z])
+                seg_id = determine_aha_segment_id(p, lv_centre, aha_axis,
+                                                  part_z[z])
                 points_epi_aha.InsertNextTuple1(seg_id)
 
                 # Record the first point of the current contour
@@ -498,9 +519,11 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
 
                 # Add the line
                 if i == (N - 1):
-                    lines_epi.InsertNextCell(2, [point_epi_id, contour_start_id])
+                    lines_epi.InsertNextCell(
+                        2, [point_epi_id, contour_start_id])
                 else:
-                    lines_epi.InsertNextCell(2, [point_epi_id, point_epi_id + 1])
+                    lines_epi.InsertNextCell(
+                        2, [point_epi_id, point_epi_id + 1])
 
                 # Increment the point index
                 point_epi_id += 1
@@ -534,26 +557,65 @@ def evaluate_wall_thickness(seg_name, output_name_stem, part=None, fix=False):
     table_thickness = np.zeros(17)
     table_thickness_med = np.zeros(17)
     table_thickness_max = np.zeros(17)
+    table_thickness_uq = np.zeros(17)
+    table_thickness_std = np.zeros(17)
+    table_thickness_skew = np.zeros(17)
+    table_thickness_99 = np.zeros(17)
+
     np_thickness = numpy_support.vtk_to_numpy(thickness).astype(np.float32)
+    np_thickness[np_thickness == -1] = np.nan
     np_points_aha = numpy_support.vtk_to_numpy(points_aha).astype(np.int8)
 
     for i in range(16):
-        table_thickness[i] = np.mean(np_thickness[np_points_aha == (i + 1)])
-        table_thickness_med[i] = np.median(np_thickness[np_points_aha == (i + 1)])
-        table_thickness_max[i] = np.max(np_thickness[np_points_aha == (i + 1)])
-    table_thickness[-1] = np.mean(np_thickness)
-    table_thickness[-1] = np.median(np_thickness)
-    table_thickness_max[-1] = np.max(np_thickness)
+        table_thickness[i] = np.nanmean(np_thickness[np_points_aha == (i + 1)])
+        table_thickness_med[i] = np.nanmedian(
+            np_thickness[np_points_aha == (i + 1)])
+        table_thickness_max[i] = np.nanmax(
+            np_thickness[np_points_aha == (i + 1)])
+        table_thickness_uq[i] = np.nanquantile(
+            np_thickness[np_points_aha == (i + 1)], 0.75)
+        table_thickness_std[i] = np.nanstd(
+            np_thickness[np_points_aha == (i + 1)])
+        table_thickness_skew[i] = stats.kurtosis(
+            np_thickness[np_points_aha == (i + 1)], nan_policy='omit')
+        table_thickness_99[i] = np.nanquantile(
+            np_thickness[np_points_aha == (i + 1)], 0.99)
+
+    table_thickness[-1] = np.nanmean(np_thickness)
+    table_thickness_med[-1] = np.nanmedian(np_thickness)
+    table_thickness_max[-1] = np.nanmax(np_thickness)
+    table_thickness_uq[-1] = np.nanquantile(np_thickness, 0.75)
+    table_thickness_std[i] = np.nanstd(np_thickness)
+    table_thickness_skew[i] = stats.kurtosis(np_thickness, nan_policy='omit')
+    table_thickness_99[-1] = np.nanquantile(np_thickness, 0.99)
 
     index = [str(x) for x in np.arange(1, 17)] + ['Global']
     df = pd.DataFrame(table_thickness, index=index, columns=['Thickness'])
-    df.to_csv('{0}.csv'.format(output_name_stem))
+    df.to_csv('{0}_mean.csv'.format(output_name_stem))
 
-    df = pd.DataFrame(table_thickness_max, index=index, columns=['Thickness_Max'])
+    df = pd.DataFrame(table_thickness_max, index=index,
+                      columns=['Thickness_Max'])
     df.to_csv('{0}_max.csv'.format(output_name_stem))
 
-    df = pd.DataFrame(table_thickness_med, index=index, columns=['Thickness_Med'])
+    df = pd.DataFrame(table_thickness_med, index=index,
+                      columns=['Thickness_Med'])
     df.to_csv('{0}_med.csv'.format(output_name_stem))
+
+    df = pd.DataFrame(table_thickness_uq, index=index,
+                      columns=['Thickness_UQ'])
+    df.to_csv('{0}_uq.csv'.format(output_name_stem))
+
+    df = pd.DataFrame(table_thickness_std, index=index,
+                      columns=['Thickness_Std'])
+    df.to_csv('{0}_std.csv'.format(output_name_stem))
+
+    df = pd.DataFrame(table_thickness_skew, index=index,
+                      columns=['Thickness_Kurt'])
+    df.to_csv('{0}_skew.csv'.format(output_name_stem))
+
+    df = pd.DataFrame(table_thickness_99, index=index,
+                      columns=['Thickness_99th'])
+    df.to_csv('{0}_99th.csv'.format(output_name_stem))
 
 
 def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_slices=False):
@@ -619,10 +681,11 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
         # Calculate the centre of the LV cavity
         # Get the largest component in case we have a bad segmentation
         cx, cy = [np.mean(x) for x in np.nonzero(endo)]
-        lv_centre = np.dot(affine, np.array([cx, cy, z, 1]))[:3]
+        lv_centre = affine.dot([cx, cy, z, 1])[:3]
 
         # Extract epicardial contour
-        contours, _ = cv2.findContours(cv2.inRange(epi, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        contours, _ = cv2.findContours(cv2.inRange(epi, 1, 1), cv2.RETR_TREE,
+                                       cv2.CHAIN_APPROX_NONE)
         epi_contour = contours[0][:, 0, :]
         epi_contour = approximate_contour(epi_contour, periodic=True)
 
@@ -631,7 +694,7 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
             y, x = epi_contour[i]
 
             # The world coordinate of this point
-            p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+            p = affine.dot([x, y, z, 1])[:3]
             points.InsertNextPoint(p[0], p[1], p[2])
 
             # The radial direction from the cavity centre to this point
@@ -643,7 +706,8 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
             points_label.InsertNextTuple1(2)
 
             # Record the AHA segment ID
-            seg_id = determine_aha_segment_id(p, lv_centre, aha_axis, part_z[z])
+            seg_id = determine_aha_segment_id(
+                p, lv_centre, aha_axis, part_z[z])
             points_aha.InsertNextTuple1(seg_id)
 
             # Record the first point of the current contour
@@ -676,7 +740,8 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
         # Extract endocardial contour
         # Note: cv2 considers an input image as a Y x X array, which is different
         # from nibabel which assumes a X x Y array.
-        contours, _ = cv2.findContours(cv2.inRange(endo, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        contours, _ = cv2.findContours(cv2.inRange(endo, 1, 1), cv2.RETR_TREE,
+                                       cv2.CHAIN_APPROX_NONE)
         endo_contour = contours[0][:, 0, :]
         endo_contour = approximate_contour(endo_contour, periodic=True)
 
@@ -685,7 +750,7 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
             y, x = endo_contour[i]
 
             # The world coordinate of this point
-            p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+            p = affine.dot([x, y, z, 1])[:3]
             points.InsertNextPoint(p[0], p[1], p[2])
 
             # The radial direction from the cavity centre to this point
@@ -697,7 +762,8 @@ def extract_myocardial_contour(seg_name, contour_name_stem, part=None, three_sli
             points_label.InsertNextTuple1(1)
 
             # Record the AHA segment ID
-            seg_id = determine_aha_segment_id(p, lv_centre, aha_axis, part_z[z])
+            seg_id = determine_aha_segment_id(
+                p, lv_centre, aha_axis, part_z[z])
             points_aha.InsertNextTuple1(seg_id)
 
             # Record the first point of the current contour
@@ -833,8 +899,10 @@ def evaluate_strain_by_length(contour_name_stem, T, dt, output_name_stem):
 
         # Calculate the segmental and global strains
         for i in range(0, 16):
-            table_strain['radial'][i, fr] = np.mean(strain[(seg_id == (i + 1)) & (dir_id == 1)])
-            table_strain['circum'][i, fr] = np.mean(strain[(seg_id == (i + 1)) & (dir_id == 2)])
+            table_strain['radial'][i, fr] = \
+                np.mean(strain[(seg_id == (i + 1)) & (dir_id == 1)])
+            table_strain['circum'][i, fr] = \
+                np.mean(strain[(seg_id == (i + 1)) & (dir_id == 2)])
         table_strain['radial'][-1, fr] = np.mean(strain[dir_id == 1])
         table_strain['circum'][-1, fr] = np.mean(strain[dir_id == 2])
 
@@ -846,7 +914,8 @@ def evaluate_strain_by_length(contour_name_stem, T, dt, output_name_stem):
         df.to_csv('{0}_{1}.csv'.format(output_name_stem, c))
 
 
-def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_name_stem):
+def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir,
+                                          output_name_stem):
     """ Perform motion tracking and strain analysis for cine MR images. """
     # Crop the image to save computation for image registration
     # Focus on the left ventricle so that motion tracking is less affected by
@@ -867,8 +936,10 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
                                three_slices=True)
 
     # Split the volume into slices
-    split_volume('{0}/sa_crop.nii.gz'.format(output_dir), '{0}/sa_crop_z'.format(output_dir))
-    split_volume('{0}/seg_sa_crop.nii.gz'.format(output_dir), '{0}/seg_sa_crop_z'.format(output_dir))
+    split_volume('{0}/sa_crop.nii.gz'.format(output_dir),
+                 '{0}/sa_crop_z'.format(output_dir))
+    split_volume('{0}/seg_sa_crop.nii.gz'.format(output_dir),
+                 '{0}/seg_sa_crop_z'.format(output_dir))
 
     # Inter-frame motion estimation
     nim = nib.load('{0}/sa_crop.nii.gz'.format(output_dir))
@@ -888,11 +959,15 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
         for fr in range(1, T):
             target_fr = fr - 1
             source_fr = fr
-            target = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, target_fr)
-            source = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, source_fr)
+            target = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(
+                output_dir, z, target_fr)
+            source = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(
+                output_dir, z, source_fr)
             par = '{0}/ffd_cine_2d_motion.cfg'.format(par_dir)
-            dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(output_dir, z, target_fr, source_fr)
-            os.system('mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
+            dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(
+                output_dir, z, target_fr, source_fr)
+            os.system(
+                'mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
 
         # Compose forward inter-frame transformation fields
         os.system('cp {0}/ffd_z{1:02d}_pair_00_to_01.dof.gz '
@@ -900,20 +975,27 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
         for fr in range(2, T):
             dofs = ''
             for k in range(1, fr + 1):
-                dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(output_dir, z, k - 1, k)
+                dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(
+                    output_dir, z, k - 1, k)
                 dofs += dof + ' '
-            dof_out = '{0}/ffd_z{1:02d}_forward_00_to_{2:02d}.dof.gz'.format(output_dir, z, fr)
-            os.system('mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
+            dof_out = '{0}/ffd_z{1:02d}_forward_00_to_{2:02d}.dof.gz'.format(
+                output_dir, z, fr)
+            os.system(
+                'mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
 
         # Backward image registration
         for fr in range(T - 1, 0, -1):
             target_fr = (fr + 1) % T
             source_fr = fr
-            target = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, target_fr)
-            source = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, source_fr)
+            target = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(
+                output_dir, z, target_fr)
+            source = '{0}/sa_crop_z{1:02d}_fr{2:02d}.nii.gz'.format(
+                output_dir, z, source_fr)
             par = '{0}/ffd_cine_2d_motion.cfg'.format(par_dir)
-            dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(output_dir, z, target_fr, source_fr)
-            os.system('mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
+            dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(
+                output_dir, z, target_fr, source_fr)
+            os.system(
+                'mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
 
         # Compose backward inter-frame transformation fields
         os.system('cp {0}/ffd_z{1:02d}_pair_00_to_{2:02d}.dof.gz '
@@ -924,19 +1006,27 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
                 dof = '{0}/ffd_z{1:02d}_pair_{2:02d}_to_{3:02d}.dof.gz'.format(output_dir, z,
                                                                                (k + 1) % T, k)
                 dofs += dof + ' '
-            dof_out = '{0}/ffd_z{1:02d}_backward_00_to_{2:02d}.dof.gz'.format(output_dir, z, fr)
-            os.system('mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
+            dof_out = '{0}/ffd_z{1:02d}_backward_00_to_{2:02d}.dof.gz'.format(
+                output_dir, z, fr)
+            os.system(
+                'mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
 
         # Average the forward and backward transformations
-        os.system('mirtk init-dof {0}/ffd_z{1:02d}_forward_00_to_00.dof.gz'.format(output_dir, z))
-        os.system('mirtk init-dof {0}/ffd_z{1:02d}_backward_00_to_00.dof.gz'.format(output_dir, z))
-        os.system('mirtk init-dof {0}/ffd_z{1:02d}_00_to_00.dof.gz'.format(output_dir, z))
+        os.system(
+            'mirtk init-dof {0}/ffd_z{1:02d}_forward_00_to_00.dof.gz'.format(output_dir, z))
+        os.system(
+            'mirtk init-dof {0}/ffd_z{1:02d}_backward_00_to_00.dof.gz'.format(output_dir, z))
+        os.system(
+            'mirtk init-dof {0}/ffd_z{1:02d}_00_to_00.dof.gz'.format(output_dir, z))
         for fr in range(1, T):
-            dof_forward = '{0}/ffd_z{1:02d}_forward_00_to_{2:02d}.dof.gz'.format(output_dir, z, fr)
+            dof_forward = '{0}/ffd_z{1:02d}_forward_00_to_{2:02d}.dof.gz'.format(
+                output_dir, z, fr)
             weight_forward = float(T - fr) / T
-            dof_backward = '{0}/ffd_z{1:02d}_backward_00_to_{2:02d}.dof.gz'.format(output_dir, z, fr)
+            dof_backward = '{0}/ffd_z{1:02d}_backward_00_to_{2:02d}.dof.gz'.format(
+                output_dir, z, fr)
             weight_backward = float(fr) / T
-            dof_combine = '{0}/ffd_z{1:02d}_00_to_{2:02d}.dof.gz'.format(output_dir, z, fr)
+            dof_combine = '{0}/ffd_z{1:02d}_00_to_{2:02d}.dof.gz'.format(
+                output_dir, z, fr)
             os.system('average_3d_ffd 2 {0} {1} {2} {3} {4}'.format(dof_forward, weight_forward,
                                                                     dof_backward, weight_backward,
                                                                     dof_combine))
@@ -959,18 +1049,23 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
                           '{0}/seg_sa_crop_warp_ffd_z{1:02d}_fr{2:02d}.nii.gz '
                           '-dofin {0}/ffd_z{1:02d}_00_to_{2:02d}.dof.gz '
                           '-target {0}/seg_sa_crop_z{1:02d}_fr00.nii.gz'.format(output_dir, z, fr))
-                image_A = nib.load('{0}/seg_sa_crop_z{1:02d}_fr00.nii.gz'.format(output_dir, z)).get_data()
-                image_B = nib.load('{0}/seg_sa_crop_warp_ffd_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, fr)).get_data()
+                image_A = nib.load(
+                    '{0}/seg_sa_crop_z{1:02d}_fr00.nii.gz'.format(output_dir, z)).get_data()
+                image_B = nib.load(
+                    '{0}/seg_sa_crop_warp_ffd_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, fr)).get_data()
                 dice_lv_myo += [[np_categorical_dice(image_A, image_B, 1),
                                  np_categorical_dice(image_A, image_B, 2)]]
-                image_names += ['{0}/seg_sa_crop_warp_ffd_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, fr)]
-            combine_name = '{0}/seg_sa_crop_warp_ffd_z{1:02d}.nii.gz'.format(output_dir, z)
+                image_names += [
+                    '{0}/seg_sa_crop_warp_ffd_z{1:02d}_fr{2:02d}.nii.gz'.format(output_dir, z, fr)]
+            combine_name = '{0}/seg_sa_crop_warp_ffd_z{1:02d}.nii.gz'.format(
+                output_dir, z)
             make_sequence(image_names, dt, combine_name)
 
     if eval_dice:
         print(np.mean(dice_lv_myo, axis=0))
         df_dice = pd.DataFrame(dice_lv_myo)
-        df_dice.to_csv('{0}/dice_cine_warp_ffd.csv'.format(output_dir), index=None, header=None)
+        df_dice.to_csv(
+            '{0}/dice_cine_warp_ffd.csv'.format(output_dir), index=None, header=None)
 
     # Merge the 2D tracked contours from all the slice
     for fr in range(0, T):
@@ -980,17 +1075,20 @@ def cine_2d_sa_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
             if not os.path.exists('{0}/myo_contour_z{1:02d}_fr{2:02d}.vtk'.format(output_dir, z, fr)):
                 continue
             reader[z] = vtk.vtkPolyDataReader()
-            reader[z].SetFileName('{0}/myo_contour_z{1:02d}_fr{2:02d}.vtk'.format(output_dir, z, fr))
+            reader[z].SetFileName(
+                '{0}/myo_contour_z{1:02d}_fr{2:02d}.vtk'.format(output_dir, z, fr))
             reader[z].Update()
             append.AddInputData(reader[z].GetOutput())
         append.Update()
         writer = vtk.vtkPolyDataWriter()
-        writer.SetFileName('{0}/myo_contour_fr{1:02d}.vtk'.format(output_dir, fr))
+        writer.SetFileName(
+            '{0}/myo_contour_fr{1:02d}.vtk'.format(output_dir, fr))
         writer.SetInputData(append.GetOutput())
         writer.Write()
 
     # Calculate the strain based on the line length
-    evaluate_strain_by_length('{0}/myo_contour_fr'.format(output_dir), T, dt, output_name_stem)
+    evaluate_strain_by_length(
+        '{0}/myo_contour_fr'.format(output_dir), T, dt, output_name_stem)
 
 
 def remove_mitral_valve_points(endo_contour, epi_contour, mitral_plane):
@@ -1006,7 +1104,8 @@ def remove_mitral_valve_points(endo_contour, epi_contour, mitral_plane):
         if not mitral_plane[x, y] and mitral_plane[prev_x, prev_y]:
             start_i = i
             break
-    endo_contour = np.concatenate((endo_contour[start_i:], endo_contour[:start_i]))
+    endo_contour = np.concatenate(
+        (endo_contour[start_i:], endo_contour[:start_i]))
 
     N = endo_contour.shape[0]
     end_i = N
@@ -1025,7 +1124,8 @@ def remove_mitral_valve_points(endo_contour, epi_contour, mitral_plane):
         if not mitral_plane[x, y] and mitral_plane[x2, y2]:
             start_i = i
             break
-    epi_contour = np.concatenate((epi_contour[start_i:], epi_contour[:start_i]))
+    epi_contour = np.concatenate(
+        (epi_contour[start_i:], epi_contour[:start_i]))
 
     N = epi_contour.shape[0]
     end_i = N
@@ -1052,7 +1152,8 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
     for y in range(Y):
         for x in range(X):
             if seg_la[x, y] == LABEL['LV'] or seg_la[x, y] == LABEL['Myo']:
-                z_sa = np.dot(np.linalg.inv(affine_sa), np.dot(affine_la, np.array([x, y, z, 1])))[2]
+                z_sa = np.linalg.inv(affine_sa).dot(
+                    affine_la.dot([x, y, z, 1]))[2]
                 la_idx = int(round(z_sa * 2))
                 lv_myo_points += [[x, y, la_idx]]
     lv_myo_points = np.array(lv_myo_points)
@@ -1089,7 +1190,8 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
     for y in range(Y):
         for x in range(X):
             if seg_la[x, y] == LABEL['LV']:
-                z_sa = np.dot(np.linalg.inv(affine_sa), np.dot(affine_la, np.array([x, y, z, 1])))[2]
+                z_sa = np.linalg.inv(affine_sa).dot(
+                    affine_la.dot([x, y, z, 1]))[2]
                 la_idx = int(round(z_sa * 2))
                 lv_points += [[x, y, la_idx]]
     lv_points = np.array(lv_points)
@@ -1099,7 +1201,7 @@ def determine_la_aha_part(seg_la, affine_la, affine_sa):
     mid_line = {}
     for la_idx in range(lv_idx_min, lv_idx_max + 1):
         mx, my = np.mean(lv_points[lv_points[:, 2] == la_idx, :2], axis=0)
-        mid_line[la_idx] = np.dot(affine_la, np.array([mx, my, z, 1]))[:3]
+        mid_line[la_idx] = affine_la.dot([mx, my, z, 1])[:3]
 
     for la_idx in range(lv_myo_idx_min, lv_idx_min):
         mid_line[la_idx] = mid_line[lv_idx_min]
@@ -1195,11 +1297,13 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
     # Extract endocardial contour
     # Note: cv2 considers an input image as a Y x X array, which is different
     # from nibabel which assumes a X x Y array.
-    contours, _ = cv2.findContours(cv2.inRange(endo, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(cv2.inRange(
+        endo, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     endo_contour = contours[0][:, 0, :]
 
     # Extract epicardial contour
-    contours, _ = cv2.findContours(cv2.inRange(epi, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(cv2.inRange(
+        epi, 1, 1), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     epi_contour = contours[0][:, 0, :]
 
     # Record the points located on the mitral valve plane.
@@ -1214,7 +1318,8 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
     # start the contours from the point next to the mitral valve plane.
     # So connecting the lines will be easier in the next step.
     if np.sum(mitral_plane) >= 1:
-        endo_contour, epi_contour = remove_mitral_valve_points(endo_contour, epi_contour, mitral_plane)
+        endo_contour, epi_contour = remove_mitral_valve_points(
+            endo_contour, epi_contour, mitral_plane)
 
     # Note that remove_mitral_valve_points may fail if the endo or epi has more
     # than one connected components. As a result, the endo_contour or epi_contour
@@ -1237,11 +1342,11 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
         y, x = endo_contour[i]
 
         # The world coordinate of this point
-        p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+        p = affine.dot([x, y, z, 1])[:3]
         points.InsertNextPoint(p[0], p[1], p[2])
 
         # The index along the long axis
-        z_sa = np.dot(np.linalg.inv(affine_sa), np.hstack([p, 1]))[2]
+        z_sa = np.linalg.inv(affine_sa).dot(np.hstack([p, 1]))[2]
         la_idx = int(round(z_sa * 2))
         la_idx = max(la_idx, la_idx_min)
         la_idx = min(la_idx, la_idx_max)
@@ -1256,7 +1361,8 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
         points_label.InsertNextTuple1(1)
 
         # Record the segment ID
-        seg_id = determine_la_aha_segment_id(p, la_idx, aha_axis, mid_line, part_z)
+        seg_id = determine_la_aha_segment_id(
+            p, la_idx, aha_axis, mid_line, part_z)
         points_aha.InsertNextTuple1(seg_id)
 
         # Add the line
@@ -1276,11 +1382,11 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
         y, x = epi_contour[i]
 
         # The world coordinate of this point
-        p = np.dot(affine, np.array([x, y, z, 1]))[:3]
+        p = affine.dot([x, y, z, 1])[:3]
         points.InsertNextPoint(p[0], p[1], p[2])
 
         # The index along the long axis
-        z_sa = np.dot(np.linalg.inv(affine_sa), np.hstack([p, 1]))[2]
+        z_sa = np.linalg.inv(affine_sa).dot(np.hstack([p, 1]))[2]
         la_idx = int(round(z_sa * 2))
         la_idx = max(la_idx, la_idx_min)
         la_idx = min(la_idx, la_idx_max)
@@ -1295,7 +1401,8 @@ def extract_la_myocardial_contour(seg_la_name, seg_sa_name, contour_name):
         points_label.InsertNextTuple1(2)
 
         # Record the segment ID
-        seg_id = determine_la_aha_segment_id(p, la_idx, aha_axis, mid_line, part_z)
+        seg_id = determine_la_aha_segment_id(
+            p, la_idx, aha_axis, mid_line, part_z)
         points_aha.InsertNextTuple1(seg_id)
 
         # Add the line
@@ -1400,7 +1507,8 @@ def evaluate_la_strain_by_length(contour_name_stem, T, dt, output_name_stem):
 
         # Calculate the segmental and global strains
         for i in range(6):
-            table_strain['longit'][i, fr] = np.mean(strain[(seg_id == (i + 1)) & (dir_id == 3)])
+            table_strain['longit'][i, fr] = np.mean(
+                strain[(seg_id == (i + 1)) & (dir_id == 3)])
         table_strain['longit'][-1, fr] = np.mean(strain[dir_id == 3])
 
     for c in ['longit']:
@@ -1456,11 +1564,15 @@ def cine_2d_la_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
     for fr in range(1, T):
         target_fr = fr - 1
         source_fr = fr
-        target = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(output_dir, target_fr)
-        source = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(output_dir, source_fr)
+        target = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(
+            output_dir, target_fr)
+        source = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(
+            output_dir, source_fr)
         par = '{0}/ffd_cine_la_2d_motion.cfg'.format(par_dir)
-        dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(output_dir, target_fr, source_fr)
-        os.system('mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
+        dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(
+            output_dir, target_fr, source_fr)
+        os.system(
+            'mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
 
     # Compose forward inter-frame transformation fields
     os.system('cp {0}/ffd_la_4ch_pair_00_to_01.dof.gz '
@@ -1468,20 +1580,27 @@ def cine_2d_la_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
     for fr in range(2, T):
         dofs = ''
         for k in range(1, fr + 1):
-            dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(output_dir, k - 1, k)
+            dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(
+                output_dir, k - 1, k)
             dofs += dof + ' '
-        dof_out = '{0}/ffd_la_4ch_forward_00_to_{1:02d}.dof.gz'.format(output_dir, fr)
-        os.system('mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
+        dof_out = '{0}/ffd_la_4ch_forward_00_to_{1:02d}.dof.gz'.format(
+            output_dir, fr)
+        os.system(
+            'mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
 
     # Backward image registration
     for fr in range(T - 1, 0, -1):
         target_fr = (fr + 1) % T
         source_fr = fr
-        target = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(output_dir, target_fr)
-        source = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(output_dir, source_fr)
+        target = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(
+            output_dir, target_fr)
+        source = '{0}/la_4ch_crop_fr{1:02d}.nii.gz'.format(
+            output_dir, source_fr)
         par = '{0}/ffd_cine_la_2d_motion.cfg'.format(par_dir)
-        dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(output_dir, target_fr, source_fr)
-        os.system('mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
+        dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(
+            output_dir, target_fr, source_fr)
+        os.system(
+            'mirtk register {0} {1} -parin {2} -dofout {3}'.format(target, source, par, dof))
 
     # Compose backward inter-frame transformation fields
     os.system('cp {0}/ffd_la_4ch_pair_00_to_{1:02d}.dof.gz '
@@ -1489,24 +1608,33 @@ def cine_2d_la_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
     for fr in range(T - 2, 0, -1):
         dofs = ''
         for k in range(T - 1, fr - 1, -1):
-            dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(output_dir, (k + 1) % T, k)
+            dof = '{0}/ffd_la_4ch_pair_{1:02d}_to_{2:02d}.dof.gz'.format(
+                output_dir, (k + 1) % T, k)
             dofs += dof + ' '
-        dof_out = '{0}/ffd_la_4ch_backward_00_to_{1:02d}.dof.gz'.format(output_dir, fr)
-        os.system('mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
+        dof_out = '{0}/ffd_la_4ch_backward_00_to_{1:02d}.dof.gz'.format(
+            output_dir, fr)
+        os.system(
+            'mirtk compose-dofs {0} {1} -approximate'.format(dofs, dof_out))
 
     # Average the forward and backward transformations
-    os.system('mirtk init-dof {0}/ffd_la_4ch_forward_00_to_00.dof.gz'.format(output_dir))
-    os.system('mirtk init-dof {0}/ffd_la_4ch_backward_00_to_00.dof.gz'.format(output_dir))
-    os.system('mirtk init-dof {0}/ffd_la_4ch_00_to_00.dof.gz'.format(output_dir))
+    os.system(
+        'mirtk init-dof {0}/ffd_la_4ch_forward_00_to_00.dof.gz'.format(output_dir))
+    os.system(
+        'mirtk init-dof {0}/ffd_la_4ch_backward_00_to_00.dof.gz'.format(output_dir))
+    os.system(
+        'mirtk init-dof {0}/ffd_la_4ch_00_to_00.dof.gz'.format(output_dir))
     for fr in range(1, T):
-        dof_forward = '{0}/ffd_la_4ch_forward_00_to_{1:02d}.dof.gz'.format(output_dir, fr)
+        dof_forward = '{0}/ffd_la_4ch_forward_00_to_{1:02d}.dof.gz'.format(
+            output_dir, fr)
         weight_forward = float(T - fr) / T
-        dof_backward = '{0}/ffd_la_4ch_backward_00_to_{1:02d}.dof.gz'.format(output_dir, fr)
+        dof_backward = '{0}/ffd_la_4ch_backward_00_to_{1:02d}.dof.gz'.format(
+            output_dir, fr)
         weight_backward = float(fr) / T
-        dof_combine = '{0}/ffd_la_4ch_00_to_{1:02d}.dof.gz'.format(output_dir, fr)
+        dof_combine = '{0}/ffd_la_4ch_00_to_{1:02d}.dof.gz'.format(
+            output_dir, fr)
         os.system('average_3d_ffd 2 {0} {1} {2} {3} {4}'.format(dof_forward, weight_forward,
-                                                              dof_backward, weight_backward,
-                                                              dof_combine))
+                                                                dof_backward, weight_backward,
+                                                                dof_combine))
 
     # Transform the contours and calculate the strain
     for fr in range(0, T):
@@ -1531,17 +1659,22 @@ def cine_2d_la_motion_and_strain_analysis(data_dir, par_dir, output_dir, output_
                       '{0}/seg4_la_4ch_crop_warp_ffd_fr{1:02d}.nii.gz '
                       '-dofin {0}/ffd_la_4ch_00_to_{1:02d}.dof.gz '
                       '-target {0}/seg4_la_4ch_crop_fr00.nii.gz'.format(output_dir, fr))
-            image_A = nib.load('{0}/seg4_la_4ch_crop_fr00.nii.gz'.format(output_dir)).get_data()
-            image_B = nib.load('{0}/seg4_la_4ch_crop_warp_ffd_fr{1:02d}.nii.gz'.format(output_dir, fr)).get_data()
+            image_A = nib.load(
+                '{0}/seg4_la_4ch_crop_fr00.nii.gz'.format(output_dir)).get_data()
+            image_B = nib.load(
+                '{0}/seg4_la_4ch_crop_warp_ffd_fr{1:02d}.nii.gz'.format(output_dir, fr)).get_data()
             dice_lv_myo += [[np_categorical_dice(image_A, image_B, 1),
                              np_categorical_dice(image_A, image_B, 2)]]
-            image_names += ['{0}/seg4_la_4ch_crop_warp_ffd_fr{1:02d}.nii.gz'.format(output_dir, fr)]
-        combine_name = '{0}/seg4_la_4ch_crop_warp_ffd.nii.gz'.format(output_dir)
+            image_names += [
+                '{0}/seg4_la_4ch_crop_warp_ffd_fr{1:02d}.nii.gz'.format(output_dir, fr)]
+        combine_name = '{0}/seg4_la_4ch_crop_warp_ffd.nii.gz'.format(
+            output_dir)
         make_sequence(image_names, dt, combine_name)
 
         print(np.mean(dice_lv_myo, axis=0))
         df_dice = pd.DataFrame(dice_lv_myo)
-        df_dice.to_csv('{0}/dice_cine_la_4ch_warp_ffd.csv'.format(output_dir), index=None, header=None)
+        df_dice.to_csv(
+            '{0}/dice_cine_la_4ch_warp_ffd.csv'.format(output_dir), index=None, header=None)
 
 
 def plot_bulls_eye(data, vmin, vmax, cmap='Reds', color_line='black'):
@@ -1589,9 +1722,11 @@ def plot_bulls_eye(data, vmin, vmax, cmap='Reds', color_line='black'):
         val = data[i - 1]
         r1, r2, theta1, theta2 = rad_deg[i]
         if theta2 > theta1:
-            mask = ((r < r1) & (r >= r2)) & ((theta >= theta1) & (theta < theta2))
+            mask = ((r < r1) & (r >= r2)) & (
+                (theta >= theta1) & (theta < theta2))
         else:
-            mask = ((r < r1) & (r >= r2)) & ((theta >= theta1) | (theta < theta2))
+            mask = ((r < r1) & (r >= r2)) & (
+                (theta >= theta1) | (theta < theta2))
         canvas[mask] = val
     plt.imshow(canvas, cmap=cmap, vmin=vmin, vmax=vmax)
     plt.colorbar()
@@ -1630,7 +1765,8 @@ def atrium_pass_quality_control(label, label_dict):
             label_t = label[:, :, 0, t]
             area = np.sum(label_t == l)
             if area == 0:
-                print('The area of {0} is 0 at time frame {1}.'.format(l_name, t))
+                print(
+                    'The area of {0} is 0 at time frame {1}.'.format(l_name, t))
                 return False
     return True
 
@@ -1660,7 +1796,7 @@ def evaluate_atrial_area_length(label, nim, long_axis):
             x = points_label[0][j]
             y = points_label[1][j]
             points += [[x, y,
-                        np.dot(np.dot(nim.affine, np.array([x, y, 0, 1]))[:3], long_axis)]]
+                        np.dot(nim.affine.dot([x, y, 0, 1])[:3], long_axis)]]
         points = np.array(points)
         points = points[points[:, 2].argsort()]
 
@@ -1701,7 +1837,7 @@ def evaluate_atrial_area_length(label, nim, long_axis):
             x = points_line[0][j]
             y = points_line[1][j]
             # World coordinate
-            point = np.dot(nim.affine, np.array([x, y, 0, 1]))[:3]
+            point = nim.affine.dot([x, y, 0, 1])[:3]
             # Distance along the long-axis
             points += [np.append(point, np.dot(point, long_axis))]
         points = np.array(points)
@@ -1728,7 +1864,8 @@ def aorta_pass_quality_control(image, seg):
             seg_t = seg[:, :, :, t]
             area = np.sum(seg_t == l)
             if area == 0:
-                print('The area of {0} is 0 at time frame {1}.'.format(l_name, t))
+                print(
+                    'The area of {0} is 0 at time frame {1}.'.format(l_name, t))
                 return False
 
         # Criterion 2: no strong image noise, which affects the segmentation accuracy.
@@ -1742,14 +1879,16 @@ def aorta_pass_quality_control(image, seg):
             max_intensity_t = np.max(image_t[seg_t == l])
             ratio = max_intensity_t / mean_intensity_ED
             if ratio >= ratio_thres:
-                print('The image becomes very noisy at time frame {0}.'.format(t))
+                print(
+                    'The image becomes very noisy at time frame {0}.'.format(t))
                 return False
 
         # Criterion 3: no fragmented segmentation
         pixel_thres = 10
         for t in range(T):
             seg_t = seg[:, :, :, t]
-            cc, n_cc = skimage.measure.label(seg_t == l, neighbors=8, return_num=True)
+            cc, n_cc = skimage.measure.label(
+                seg_t == l, neighbors=8, return_num=True)
             count_cc = 0
             for i in range(1, n_cc + 1):
                 binary_cc = (cc == i)
@@ -1766,6 +1905,7 @@ def aorta_pass_quality_control(image, seg):
         for t in range(T):
             ratio = A[t] / float(A[t-1])
             if ratio >= 2 or ratio <= 0.5:
-                print('There is abrupt change of area at time frame {0}.'.format(t))
+                print(
+                    'There is abrupt change of area at time frame {0}.'.format(t))
                 return False
     return True
